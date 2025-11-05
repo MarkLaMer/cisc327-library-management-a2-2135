@@ -1,10 +1,12 @@
 import pytest
+import requests
 from unittest.mock import Mock
 # Import the functions and PaymentGateway class from the library service module
 import services.library_service as svc
 from services.library_service import pay_late_fees, PaymentGateway
 
 def test_pay_late_fees_successful_payment(mocker):
+    """Pays a positive late fee with a mocked gateway that returns success and asserts correct args and messaging."""
     # Stub external dependencies: calculate late fee returns a positive fee, book lookup returns a title
     mocker.patch("services.library_service.calculate_late_fee_for_book", return_value={"fee_amount": 5.00, "days_overdue": 10})
     mocker.patch("services.library_service.get_book_by_id", return_value={"title": "Test Book"})
@@ -23,6 +25,7 @@ def test_pay_late_fees_successful_payment(mocker):
     )
 
 def test_pay_late_fees_payment_declined(mocker):
+    """Handles a declined charge from the gateway and reports failure without a transaction id."""
     # Stub dependencies to return a positive late fee and book title
     mocker.patch("services.library_service.calculate_late_fee_for_book", return_value={"fee_amount": 2.50, "days_overdue": 5})
     mocker.patch("services.library_service.get_book_by_id", return_value={"title": "Another Book"})
@@ -40,6 +43,7 @@ def test_pay_late_fees_payment_declined(mocker):
     )
 
 def test_pay_late_fees_invalid_patron_id(mocker):
+    """Rejects payment when patron_id fails validation and never calls the payment gateway."""
     # Even if we stub the dependencies, they should not be used due to early validation failure
     mocker.patch("services.library_service.calculate_late_fee_for_book", return_value={"fee_amount": 1.00, "days_overdue": 1})
     mocker.patch("services.library_service.get_book_by_id", return_value={"title": "Book"})
@@ -55,6 +59,7 @@ def test_pay_late_fees_invalid_patron_id(mocker):
     mock_gateway.process_payment.assert_not_called()
 
 def test_pay_late_fees_no_late_fees(mocker):
+    """Skips charging when calculated fee is zero and confirms the gateway is not invoked."""
     # Stub fee calculation to return zero fee
     mocker.patch("services.library_service.calculate_late_fee_for_book", return_value={"fee_amount": 0.0, "days_overdue": 0})
     mocker.patch("services.library_service.get_book_by_id", return_value={"title": "Book"})
@@ -67,6 +72,7 @@ def test_pay_late_fees_no_late_fees(mocker):
     mock_gateway.process_payment.assert_not_called()  # Should not call gateway for zero fee
 
 def test_pay_late_fees_network_error(mocker):
+    """Surfaces exceptions raised by the gateway as a user-facing payment processing error."""
     # Stub a positive fee to ensure the payment gateway will be invoked
     mocker.patch("services.library_service.calculate_late_fee_for_book", return_value={"fee_amount": 7.00, "days_overdue": 3})
     mocker.patch("services.library_service.get_book_by_id", return_value={"title": "Network Book"})
@@ -82,3 +88,72 @@ def test_pay_late_fees_network_error(mocker):
     mock_gateway.process_payment.assert_called_once_with(
         patron_id="222222", amount=7.00, description="Late fees for 'Network Book'"
     )
+
+
+
+@pytest.fixture(autouse=True)
+def _fast_sleep(monkeypatch):
+    """Autouse fixture that patches time.sleep to a no-op so tests run quickly."""
+    # keep tests snappy
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+def test_process_payment_invalid_amount_zero(monkeypatch):
+    """Validates process_payment rejects a zero amount and returns a clear error message."""
+    monkeypatch.setattr(requests, "post", lambda *a, **k: None)  # no real HTTP
+    g = PaymentGateway()
+    ok, txn, msg = g.process_payment("123456", 0, "Late fees")
+    assert not ok and txn == "" and "Invalid amount" in msg
+
+def test_process_payment_amount_exceeds_limit(monkeypatch):
+    """Validates process_payment rejects amounts above the hard limit and returns an error."""
+    monkeypatch.setattr(requests, "post", lambda *a, **k: None)
+    g = PaymentGateway()
+    ok, txn, msg = g.process_payment("123456", 1000.01, "Late fees")
+    assert not ok and txn == "" and "exceeds limit" in msg
+
+def test_process_payment_invalid_patron_id(monkeypatch):
+    """Validates process_payment rejects non-numeric or wrong-length patron ids."""
+    monkeypatch.setattr(requests, "post", lambda *a, **k: None)
+    g = PaymentGateway()
+    ok, txn, msg = g.process_payment("ABC", 10.0, "Late fees")
+    assert not ok and txn == "" and "Invalid patron ID" in msg
+
+def test_process_payment_success_builds_request_and_txn(monkeypatch):
+    """Confirms process_payment builds the expected HTTP request, returns success, and formats the txn id."""
+    called = {}
+
+    def fake_post(url, **kwargs):
+        called["url"] = url
+        called["kwargs"] = kwargs
+        return None  # your implementation doesn’t read the response
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr("time.time", lambda: 1710000000)
+
+    g = PaymentGateway(api_key="XYZ")
+    ok, txn, msg = g.process_payment("123456", 10.5, "Late fees")
+    assert ok is True
+    assert txn == "txn_123456_1710000000"
+    assert "processed successfully" in msg
+
+    # assert request shape
+    assert called["url"].endswith("/charges")
+    hdrs = called["kwargs"]["headers"]
+    body = called["kwargs"]["json"]
+    assert hdrs["Authorization"] == "Bearer XYZ"
+    assert body["customer_id"] == "123456"
+    assert body["amount"] == 10.5
+    assert body["currency"] == "usd"
+    assert body["description"] == "Late fees"
+
+def test_verify_payment_status_completed(monkeypatch):
+    """Checks the happy path of verify_payment_status returning a completed status and metadata."""
+    monkeypatch.setattr("time.time", lambda: 1710001111)
+    g = PaymentGateway()
+    result = g.verify_payment_status("txn_abc")
+    assert result == {
+        "status": "completed",
+        "transaction_id": "txn_abc",
+        "amount": 10.50,
+        "timestamp": 1710001111,
+    }
